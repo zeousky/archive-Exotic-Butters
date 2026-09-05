@@ -1,0 +1,9 @@
+# Pin Node 20 for this legacy CommonJS discord.js bot (Railpack reads engines too).
+[variables]
+NODE_VERSION = "20"
+
+[phases.install]
+cmds = ["npm ci --omit=dev"]
+
+[start]
+cmd = "npm start"

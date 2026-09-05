@@ -1,0 +1,34 @@
+{
+  "name": "exotic-butters-bot",
+  "version": "2.0.0",
+  "description": "Exotic Butters Discord bot - slash commands that drop the mp3 in chat or DMs",
+  "main": "index.js",
+  "bin": {
+    "chatb": "./chatb.js",
+    "coderb": "./coderb.js",
+    "routerb": "./routerb.js"
+  },
+  "engines": {
+    "node": "20.x",
+    "npm": ">=10.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js",
+    "deploy-guild": "node deploy-guild.js",
+    "cleanup": "node cleanup.js",
+    "coderb": "node coderb.js",
+    "chatb": "node chatb.js",
+    "chatb-agent": "node chatb-agent.js",
+    "routerb": "node routerb.js",
+    "chat": "node example-chat-basic.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@heyputer/puter.js": "^2.5.4",
+    "discord.js": "^14.13.0",
+    "dotenv": "^17.4.2"
+  }
+}

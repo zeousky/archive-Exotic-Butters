@@ -1,0 +1,337 @@
+/**
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import type { Actor } from '../actor';
+
+/**
+ * Every route method PuterRouter exposes. Mirrors the express router surface
+ * plus WebDAV verbs that some endpoints still use.
+ *
+ * `use` and `all` don't map to a single HTTP verb — they're treated uniformly
+ * by the materializer (see `v2/server.ts`).
+ */
+export type RouteMethod =
+    | 'use'
+    | 'all'
+    | 'get'
+    | 'head'
+    | 'post'
+    | 'put'
+    | 'delete'
+    | 'patch'
+    | 'options'
+    | 'lock'
+    | 'unlock'
+    | 'propfind'
+    | 'proppatch'
+    | 'mkcol'
+    | 'copy'
+    | 'move';
+
+/**
+ * Path shape accepted by express route methods. Kept permissive rather than
+ * re-exporting express's internal `PathParams` (which isn't stable public API).
+ */
+export type RoutePath = string | RegExp | Array<string | RegExp>;
+
+/**
+ * Per-route options declared by the caller.
+ *
+ * The materializer (`v2/server.ts#materializeRoute`) translates these into a
+ * middleware chain in this order:
+ *
+ *     subdomain → requireAuth (+ suspended) → emailConfirmed →
+ *     requireUserActor → adminOnly → allowedAppIds →
+ *     caller `middleware: []` → handler
+ *
+ * `requireUserActor`, `adminOnly`, and `allowedAppIds` all imply
+ * `requireAuth`; the materializer dedupes so only one auth gate ends up
+ * in the chain. Commented-out slots are reserved for the next chunks
+ * (body parsing, post-auth gates, timing).
+ */
+/** One rate-limit window. See `RouteOptions.rateLimit` for semantics. */
+export interface RouteRateLimit {
+    limit: number;
+    window: number;
+    /**
+     * Per-subscription overrides for `limit` (`SubscriptionPolicy.id`
+     * → cap). Same mechanic as `concurrent.bySubscription`: resolved
+     * via the metering service per request; falls back to the base
+     * `limit` when there's no actor / no metering / no match.
+     */
+    bySubscription?: Record<string, number>;
+    key?: 'fingerprint' | 'ip' | 'user' | ((req: Request) => string);
+    scope?: string;
+    backend?: 'memory' | 'redis' | 'kv';
+}
+
+export interface RouteOptions {
+    /** Extra per-route middleware. Applied after built-in gates, before the handler. */
+    middleware?: RequestHandler[];
+
+    /**
+     * Subdomain routing. If set, the route only matches requests whose
+     * leftmost subdomain is in this list (via `next('route')` skip).
+     *
+     * If omitted, verb-routes (get/post/etc.) are restricted to the root
+     * origin only (no subdomain). Pass `'*'` to explicitly match ANY
+     * subdomain/root. `use()` middleware is not gated by default.
+     */
+    subdomain?: string | string[];
+
+    /** Reject anonymous + suspended-user requests with 401/403. Only allows user and app actors */
+    requireAuth?: boolean;
+
+    /** Reject app/access-token actors. Implies `requireAuth`. */
+    requireUserActor?: boolean;
+
+    /**
+     * Only meaningful alongside `requireUserActor`. Relaxes the access-token
+     * half of that gate so a FULL-ACCESS personal access token (the user's own
+     * credential) is admitted — third-party apps and scoped tokens stay
+     * blocked. Use ONLY on user-resource / inference endpoints that gate with
+     * `requireUserActor` purely to keep apps out (e.g. the AI proxy). NEVER set
+     * on account/security/credential routes — those must stay closed to every
+     * access token. Default-deny: omitting this keeps PATs blocked.
+     */
+    allowFullAccessToken?: boolean;
+
+    /** Allows access-tokens */
+    allowAccessToken?: boolean;
+
+    /**
+     * Reject unless the actor's username is `admin`, `system`, or one of the
+     * extras in this array. `true` means just `admin`/`system`; an array adds
+     * to that pair (does not replace it). Implies `requireAuth`.
+     *
+     * Does NOT imply `requireUserActor` — admin endpoints accept an admin's
+     * access-token or app-under-user actor. Combine with `requireUserActor`
+     * to restrict to browser sessions.
+     */
+    adminOnly?: boolean | string[];
+
+    /** Reject unless the actor is acting through one of these apps. Implies `requireAuth`. */
+    allowedAppIds?: string[];
+
+    /**
+     * Allow users whose account is pending email confirmation to access
+     * this route. By default, any authenticated route rejects users where
+     * `requires_email_confirmation && !email_confirmed` with 403. Set
+     * this to `true` on essential flows that must remain accessible
+     * before confirmation: logout, email-confirm, whoami, save-account,
+     * anti-CSRF token, etc.
+     *
+     * Only meaningful when the route also requires authentication (via
+     * `requireAuth`, `requireUserActor`, `adminOnly`, or `allowedAppIds`).
+     */
+    allowUnconfirmed?: boolean;
+
+    /**
+     * Reject unless the actor's user has a confirmed email. 400 with
+     * `account_is_not_verified` on failure. No-op when
+     * `config.strict_email_verification_required` is falsy, so self-hosted
+     * deployments can opt in via config. Implies `requireAuth` but NOT
+     * `requireUserActor` — app-under-user actors also carry a `.user`, so
+     * verification applies uniformly whether the user acts directly or
+     * through an app.
+     */
+    requireVerified?: boolean;
+
+    /**
+     * Per-route JSON body parsing override. By default the global parser
+     * handles every `application/json` request with a 50mb limit and stashes
+     * the raw bytes on `req.rawBody` for signature-verification use cases.
+     *
+     * Use this option only when a route needs different parser settings:
+     *   - `false` — opt out of parsing entirely (rare; the route reads the
+     *     raw stream itself, e.g. some webhook proxies). The global parser
+     *     will still have already run if the content-type was JSON, so this
+     *     is mostly useful for routes that accept *non*-JSON body shapes
+     *     and want to ensure no further parsers attach.
+     *   - `{ limit, type }` — override the limit (e.g., for ML endpoints
+     *     that legitimately need 100mb) or the matched content-type list
+     *     (e.g., to ALSO accept `application/x-ndjson`).
+     */
+    bodyJson?: false | { limit?: string; type?: string | string[] };
+
+    /**
+     * Per-route raw (Buffer) body parser. Use for binary uploads where the
+     * route handler wants `req.body: Buffer` directly. Default content-type
+     * match is `application/octet-stream`; pass `type` to override.
+     */
+    bodyRaw?: boolean | { limit?: string; type?: string | string[] };
+
+    /**
+     * Per-route text body parser. `req.body` becomes a string. Default
+     * content-type match is `text/plain`.
+     */
+    bodyText?: boolean | { limit?: string; type?: string | string[] };
+
+    /**
+     * Per-route urlencoded form parser. `req.body` becomes a parsed object.
+     * Default `extended: true` (uses `qs`); pass `extended: false` for the
+     * built-in `querystring` parser.
+     */
+    bodyUrlencoded?: boolean | { limit?: string; extended?: boolean };
+
+    /**
+     * Require captcha verification. When `true`, the route rejects
+     * requests that don't carry valid `captchaToken` + `captchaAnswer`
+     * fields in the body. No-op when captcha is disabled in config.
+     */
+    captcha?: boolean;
+
+    /**
+     * Require a valid one-time anti-CSRF token in `req.body.anti_csrf`.
+     * The token is consumed on use. Requires authentication (keyed by
+     * user uuid).
+     */
+    antiCsrf?: boolean;
+
+    /**
+     * Per-route rate limiting. In-memory sliding window keyed by
+     * request identity.
+     *
+     * `key` controls how requests are bucketed:
+     *   - `'fingerprint'` (default) — IP + User-Agent hash. Safe for
+     *     shared IPs (offices, VPNs).
+     *   - `'ip'` — bare IP address.
+     *   - `'user'` — actor's user ID. Use for authenticated routes
+     *     where you want per-account limits.
+     *   - `(req) => string` — custom key function.
+     *
+     * `scope` is an optional namespace prefix to isolate counters
+     * between routes that share the same key strategy. Defaults to
+     * the route path.
+     *
+     * `backend` selects the storage backend ('memory' / 'redis' / 'kv').
+     * All registered backends stay co-resident at runtime, so different
+     * routes can pick whichever fits their access pattern. Omitting
+     * `backend` uses the server-wide default (`config.rate_limit.backend`).
+     *
+     * An array applies every limit independently (a request must pass all
+     * of them). Use this to pair a per-client budget with a coarser
+     * backstop on a different key — e.g. per-fingerprint for fairness on
+     * shared IPs, plus per-IP so rotating headers can't mint fresh
+     * fingerprint buckets indefinitely. Give each entry its own `scope`
+     * so the counters don't collide.
+     */
+    rateLimit?: RouteRateLimit | RouteRateLimit[];
+
+    /**
+     * Concurrent in-flight limiting. Caps how many requests for this
+     * key are simultaneously in flight, rather than how many fire per
+     * window. A slot is acquired before the handler runs and released
+     * on `res.finish` / `res.close` — aborted requests still give their
+     * slot back.
+     *
+     *   { concurrent: { limit: 5, key: 'user' } }
+     *   { concurrent: { limit: 5, bySubscription: { user_free: 2 } } }
+     *
+     * `bySubscription` overrides the base `limit` per subscription tier
+     * (`SubscriptionPolicy.id`) — `user_free`, `temp_free`, `unlimited`
+     * out of the box. Requires the metering service to be wired into
+     * the rate-limit module (`configureRateLimit({ metering: ... })`)
+     * and an authenticated actor; otherwise the base `limit` applies.
+     *
+     * `key`, `scope`, `backend` parallel the `rateLimit` option exactly;
+     * there's no `window` — that's the whole point of the second gate.
+     */
+    concurrent?: {
+        limit: number;
+        bySubscription?: Record<string, number>;
+        key?: 'fingerprint' | 'ip' | 'user' | ((req: Request) => string);
+        scope?: string;
+        backend?: 'memory' | 'redis' | 'kv';
+    };
+
+    // Reserved — wire as the corresponding features/services land:
+    // bodyFiles?: string[];      // multer-style multipart fields
+    // responseTimeout?: number;
+}
+
+/**
+ * Normalized route record produced by PuterRouter (and the class/method
+ * decorators). `path` is omitted only for `router.use(handler)` / `use(options, handler)`.
+ */
+export interface RouteDescriptor {
+    method: RouteMethod;
+    path?: RoutePath;
+    options: RouteOptions;
+    handler: RequestHandler;
+}
+
+/**
+ * Shape stored on decorated controller prototypes by `@Get` / `@Post` / etc.
+ * `handler` is the method reference — still unbound at decoration time;
+ * the installed `registerRoutes` binds it to the instance at walk time.
+ */
+export interface CollectedRoute {
+    method: RouteMethod;
+    path?: RoutePath;
+    options: RouteOptions;
+    handler: RequestHandler;
+}
+
+/** Internal: the property name used to stash decorator metadata on prototypes. */
+export const ROUTES_METADATA_KEY = '__puterRoutes' as const;
+/** Internal: the property name used to stash a controller's path prefix. */
+export const PREFIX_METADATA_KEY = '__puterControllerPrefix' as const;
+
+// -- Type narrowing helpers ------------------------------------------
+//
+// When a route declares a gate option (requireAuth, requireUserActor,
+// adminOnly, allowedAppIds), the materializer guarantees the corresponding
+// gate runs before the handler. These types encode that guarantee at the
+// type level, so handlers can use `req.actor` without a non-null assertion.
+//
+// Activated by the `const` generic on PuterRouter's per-method overloads:
+// the literal options object is captured precisely (e.g. `{requireAuth: true}`
+// rather than `{requireAuth: boolean}`), letting the conditional branches
+// match by value.
+
+/**
+ * `true` iff the materializer will run an auth gate before the handler.
+ * Branches match readonly *and* mutable arrays so callers don't need
+ * `as const` on every options literal.
+ */
+export type AuthRequired<O extends RouteOptions> = O extends {
+    requireAuth: true;
+}
+    ? true
+    : O extends { requireUserActor: true }
+      ? true
+      : O extends { adminOnly: true | readonly string[] | string[] }
+        ? true
+        : O extends { allowedAppIds: readonly string[] | string[] }
+          ? true
+          : false;
+
+/** Express `Request` with `actor` narrowed based on the route's options. */
+export type TypedRequest<O extends RouteOptions> = Omit<Request, 'actor'> & {
+    actor: AuthRequired<O> extends true ? Actor : Actor | undefined;
+};
+
+/** Handler signature whose `req.actor` reflects the route's gate options. */
+export type TypedHandler<O extends RouteOptions> = (
+    req: TypedRequest<O>,
+    res: Response,
+    next: NextFunction,
+) => void | Promise<void>;

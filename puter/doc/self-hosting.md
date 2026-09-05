@@ -1,0 +1,479 @@
+# Self-Hosting Puter
+
+`docker-compose.yml` brings up Puter **plus every external service it needs** — MariaDB, Valkey, DynamoDB-local, RustFS S3, nginx — wired together. Closest thing to a production deployment you can self-manage on a single host.
+
+## One-line installer (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HeyPuter/puter/main/install.sh | sh
+```
+
+Generates secrets, writes `.env` + `puter/config/config.json`, downloads `docker-compose.yml` from the OSS repo, and runs `docker compose up -d`. Re-running is safe — it won't overwrite existing config (set `PUTER_FORCE=1` to rotate). Use the manual steps below if you want to inspect or tweak each step yourself.
+
+## Requirements
+
+- **Docker** with the `compose` plugin.
+- A **domain** with DNS access — you need a wildcard record (`*.your-domain.com` → server IP). Puter routes by subdomain (`api.<domain>`, `site.<domain>`, `app.<domain>`).
+- Optional: **TLS certs** (or `certbot` to grab them — see Step 3).
+
+## What's running
+
+| Container       | Image                    | Role                                                       |
+| --------------- | ------------------------ | ---------------------------------------------------------- |
+| `puter-nginx`   | `nginx:1.27-alpine`      | Reverse proxy on 80 (and 443 if TLS); forwards to Puter    |
+| `puter`         | `ghcr.io/heyputer/puter` | The app                                                    |
+| `puter-mariadb` | `mariadb:11`             | SQL database — schema applied automatically on first boot  |
+| `puter-valkey`  | `valkey/valkey:8-alpine` | Redis-compatible cache + rate-limiter                      |
+| `puter-dynamo`  | `amazon/dynamodb-local`  | KV store — table auto-created on first boot                |
+| `puter-s3`      | `rustfs/rustfs`          | S3-compatible object storage (MinIO drop-in noted in file) |
+| `puter-s3-init` | `amazon/aws-cli`         | One-shot — creates the bucket on first boot, then exits    |
+
+Optional services (compose profile `ai`, opt-in):
+
+| Container           | Image           | Role                                                           |
+| ------------------- | --------------- | -------------------------------------------------------------- |
+| `puter-ollama`      | `ollama/ollama` | Local LLM provider (CPU; GPU passthrough opt-in)               |
+| `puter-ollama-init` | `ollama/ollama` | One-shot — pulls the default model (`tinyllama`) on first boot |
+
+State lives under `./puter/data/<service>/`.
+
+---
+
+## Step 1 — Create `.env` and `puter/config/config.json`
+
+> ⚠️ **Run this whole block in one shell session.** It generates secrets once and writes them into both `.env` (read by docker compose) and `config.json` (read by Puter). The two files **must** agree on the MariaDB password and the S3 secret — if they drift, MariaDB initialises with one password and Puter tries to log in with another, and you get `ER_ACCESS_DENIED_ERROR`.
+
+```bash
+MARIADB_ROOT_PASSWORD=$(openssl rand -hex 32)
+MARIADB_PASSWORD=$(openssl rand -hex 32)
+S3_SECRET_KEY=$(openssl rand -hex 32)
+JWT_SECRET=$(openssl rand -hex 64)
+JWT_SECRET_V2=$(openssl rand -hex 64)
+URL_SIGNATURE_SECRET=$(openssl rand -hex 64)
+
+cat > .env <<EOF
+HTTP_PORT=80
+# HTTPS_PORT=443     # uncomment after enabling TLS in Step 3
+
+MARIADB_ROOT_PASSWORD=$MARIADB_ROOT_PASSWORD
+MARIADB_DATABASE=puter
+MARIADB_USER=puter
+MARIADB_PASSWORD=$MARIADB_PASSWORD
+
+S3_ACCESS_KEY=puter
+S3_SECRET_KEY=$S3_SECRET_KEY
+S3_BUCKET=puter-local
+EOF
+
+mkdir -p puter/config puter/data puter/tls
+cat > puter/config/config.json <<EOF
+{
+    "domain": "puter.localhost",
+    "protocol": "http",
+    "pub_port": 80,
+    "env": "prod",
+
+    "static_hosting_domain": "site.puter.localhost",
+    "static_hosting_domain_alt": "host.puter.localhost",
+    "private_app_hosting_domain": "app.puter.localhost",
+    "private_app_hosting_domain_alt": "dev.puter.localhost",
+
+    "jwt_secret": "$JWT_SECRET",
+    "jwt_secret_v2": "$JWT_SECRET_V2",
+    "allow_v1_tokens": true,
+    "url_signature_secret": "$URL_SIGNATURE_SECRET",
+
+    "database": {
+        "engine": "mysql",
+        "host": "mariadb",
+        "port": 3306,
+        "user": "puter",
+        "password": "$MARIADB_PASSWORD",
+        "database": "puter",
+        "migrationPaths": ["/opt/puter/dist/src/backend/clients/database/migrations/mysql"]
+    },
+
+    "redis": {
+        "startupNodes": [{ "host": "valkey", "port": 6379 }],
+        "tls": false
+    },
+
+    "dynamo": {
+        "endpoint": "http://dynamo:8000",
+        "bootstrapTables": true,
+        "aws": {
+            "access_key": "fake",
+            "secret_key": "fake",
+            "region": "us-east-1"
+        }
+    },
+
+    "s3": {
+        "s3Config": {
+            "endpoint": "http://s3:9000",
+            "publicEndpoint": "http://s3.puter.localhost",
+            "accessKeyId": "puter",
+            "secretAccessKey": "$S3_SECRET_KEY",
+            "region": "us-east-1",
+            "forcePathStyle": true
+        }
+    },
+    "s3_bucket": "puter-local",
+    "s3_region": "us-east-1",
+
+    "providers": {
+        "ollama": { "enabled": false }
+    },
+
+    "trust_proxy": 1
+}
+EOF
+```
+
+Replace `puter.localhost`, `site.puter.localhost`, `host.puter.localhost`, `dev.puter.localhost` and `app.puter.localhost` with your actual domain (or leave it for a localhost-only trial).
+
+Why these knobs:
+
+- `jwt_secret` + `jwt_secret_v2` — Puter signs new auth tokens with `jwt_secret_v2` (v2 token format, `kid: 'v2'` JWT header). `jwt_secret` is verify-only and lets tokens minted before this version (cookies still in users' browsers, stored API tokens) keep working. `allow_v1_tokens: true` keeps that fallback enabled. Fresh installs can leave it as-is; future versions will flip the flag to `false` and retire `jwt_secret` entirely once legacy tokens have drained.
+- `env: "prod"` — the bundled `config.default.json` ships with `env: "dev"` (matches the source-tree `npm run start=gui` workflow, which expects webpack-dev-server emitting a CSS manifest). Self-host runs against pre-built static bundles, so `env: "prod"` makes the homepage emit the `/dist/bundle.min.css` `<link>` tag instead of waiting on a manifest that doesn't exist.
+- `database.migrationPaths` — Puter applies the bundled MySQL/MariaDB schema on boot. The migration files are idempotent, so it is safe to leave this configured across restarts.
+- `dynamo.bootstrapTables: true` — Puter creates its KV table on boot. **Only set against a local emulator**, never real AWS.
+- `dynamo.aws` keys are dummies; DynamoDB-local doesn't validate them but the AWS SDK requires _something_. **Note:** DynamoDB uses `access_key` / `secret_key` (snake_case); S3 below uses `accessKeyId` / `secretAccessKey` (camelCase). Not interchangeable.
+- `providers.ollama.enabled: false` — Puter auto-probes a local Ollama at `127.0.0.1:11434` by default; without one running you'd see `ECONNREFUSED` on every boot. To run a bundled Ollama, see [Optional: local LLM (Ollama)](#optional-local-llm-ollama) below.
+- `s3.s3Config.forcePathStyle: true` — RustFS / MinIO / fauxqs need path-style URLs (`<endpoint>/<bucket>`). Real AWS S3 wants virtual-hosted (`<bucket>.<endpoint>`) — drop this flag (or set `false`) when you swap to real S3.
+- `s3.s3Config.publicEndpoint` — `endpoint` (`http://s3:9000`) only resolves inside the docker network; presigned upload/download URLs handed to the browser need a host-reachable URL. nginx routes the `s3.<domain>` subdomain to RustFS internally and preserves the Host header end-to-end (required for S3 signature validation), so the browser hits the same port/protocol as the rest of the app — no separate published port, no mixed-content surprises when you turn on TLS. Switch to `https://s3.<your-domain>` once you enable TLS in Step 3. Real AWS S3 doesn't need this — its endpoint is already public; drop the field entirely.
+- `trust_proxy: 1` — nginx terminates TLS and forwards `X-Forwarded-For`. Without this, `req.ip` is the docker-network address of the nginx container instead of the real client IP, which breaks rate limiting and IP-based audit logs. `1` = one trusted hop (nginx). Bump to `2` if you put Cloudflare in front of nginx; never set `true` (it trusts every hop and makes XFF forgeable).
+
+> If you ever change `MARIADB_PASSWORD` after first boot, `.env` alone won't update MariaDB — its credentials are baked into `./puter/data/mariadb/` on first init. Either rotate the password inside MariaDB by hand or `docker compose down && rm -rf ./puter/data/mariadb` to start fresh.
+
+## Step 2 — Point DNS at the server \[Optional\]
+
+In your DNS provider, add records for the main domain plus the subdomains Puter and nginx route on (`api.*`, `site.*`, `app.*`, `s3.*`):
+
+```
+A      puter.localhost          → <your server's public IP>
+A      *.puter.localhost        → <your server's public IP>
+A      site.puter.localhost     → <your server's public IP>
+A      *.site.puter.localhost   → <your server's public IP>
+A      host.puter.localhost     → <your server's public IP>
+A      *.host.puter.localhost   → <your server's public IP>
+A      app.puter.localhost      → <your server's public IP>
+A      *.app.puter.localhost    → <your server's public IP>
+A      dev.puter.localhost      → <your server's public IP>
+A      *.dev.puter.localhost    → <your server's public IP>
+```
+
+The wildcards are required — Puter routes via subdomains (`api.*`, `app.*`, etc.) and nginx routes browser S3 traffic via `s3.*` to RustFS.
+
+## Step 3 — TLS (recommended for public installs) \[Optional\]
+
+Skip this for a quick local demo. Don't skip it for users typing passwords.
+
+**Get a wildcard cert.** Easiest path with Let's Encrypt + DNS-01 (works for wildcards):
+
+```bash
+sudo certbot certonly --manual --preferred-challenges dns \
+    -d puter.localhost -d "*.puter.localhost" \
+    -d site.puter.localhost -d "*.site.puter.localhost" \
+    -d host.puter.localhost -d "*.host.puter.localhost" \
+    -d app.puter.localhost -d "*.app.puter.localhost" \
+    -d dev.puter.localhost -d "*.dev.puter.localhost"
+```
+
+The cert needs to cover `*.puter.localhost` so that `s3.puter.localhost` (browser S3 endpoint), plus Puter's own `api.*` / `app.*` subdomains, all validate.
+
+Drop the resulting `fullchain.pem` and `privkey.pem` into `./puter/tls/`.
+
+**Wire nginx to use them:**
+
+1. Open [nginx/nginx.conf](../nginx/nginx.conf), uncomment **both** `# server { listen 443 ssl … }` blocks (one for `s3.*`, one for the catch-all).
+2. (Optional) Replace the body of the port-80 blocks with `return 301 https://$host$request_uri;` to force HTTPS everywhere.
+3. In [docker-compose.yml](../docker-compose.yml), uncomment the `443:443` port mapping under the `nginx` service.
+4. In `.env`, uncomment `HTTPS_PORT=443`.
+5. In `config.json`, switch:
+    ```json
+    { "protocol": "https", "pub_port": 443 }
+    ```
+    …and update the S3 public endpoint:
+    ```json
+    "s3": { "s3Config": { "publicEndpoint": "https://s3.puter.local", ... } }
+    ```
+
+## Running behind your own reverse proxy
+
+The bundled `puter-nginx` mirrors production and is the supported default — it terminates TLS (Step 3) and forwards every Host to Puter. But plenty of self-hosters already run their own edge proxy (Caddy, Traefik, HAProxy, a cloud load balancer, another nginx). You can put Puter behind it instead; Puter doesn't terminate TLS itself in any setup, so "your proxy does TLS" is just a matter of pointing it at the Puter container and getting a handful of details right.
+
+You can keep the bundled nginx as the single hop your proxy talks to, or bypass it and forward straight to the Puter container on port `4100` (uncomment the `4100:4100` mapping under the `puter` service in [docker-compose.yml](../docker-compose.yml), or attach your proxy to the compose network). Either works — what matters is the rules below.
+
+**The rules that actually matter** (getting any of these wrong is what causes the redirect loops and "Invalid Host header" failures people hit):
+
+1. **Don't rewrite the `Host` header.** Puter routes entirely on Host — `api.<domain>`, `site.<domain>`, `app.<domain>` are all distinguished by the incoming host. Forward the original host through unchanged. Do **not** rewrite external hostnames to an internal name like `puter.local`; that forces you to remap every subdomain by hand and still breaks signed-URL and CORS checks. Most proxies preserve Host by default — just don't override it.
+
+2. **The external domain must equal `domain` in your `config.json`.** If users reach the box at `puter.example.com`, then `domain` must be `puter.example.com` and the hosting domains must be its real subdomains (`site.puter.example.com`, `app.puter.example.com`, …) — exactly as the installer/`config.json` lays them out. Puter rejects hosts it doesn't recognize with `Invalid Host header`.
+
+3. **Set `protocol` to match the public scheme.** When your proxy terminates TLS, set `"protocol": "https"` (installer: `PUTER_PROTOCOL=https`). Puter builds its origins, redirects, signed S3 URLs, and OIDC callback URLs from this — leave it `http` behind an HTTPS proxy and you get redirect loops, broken logins, and mixed-content errors.
+
+4. **Forward the standard proxy headers.** Puter needs:
+    - `Host` — the original request host (rule 1).
+    - `X-Forwarded-Proto` — the **external** scheme (`https`), so Puter knows TLS was terminated upstream.
+    - `X-Forwarded-For` — the real client IP (rate limiting + audit logs).
+    - `Upgrade` / `Connection` — passed through for WebSocket / socket.io upgrades, or the realtime connection silently fails.
+
+5. **Set `trust_proxy` to the number of hops in front of Puter.** One external proxy talking directly to Puter → `"trust_proxy": 1` (installer: `PUTER_TRUST_PROXY=1`). A second proxy in front (e.g. Cloudflare → your proxy → Puter) → `2`. This is the count of proxies between the client and Puter, **including** the bundled nginx if you keep it. Too low and `req.ip` becomes a proxy address (breaks rate limiting); never set `true` (it trusts every hop and makes `X-Forwarded-For` forgeable).
+
+6. **Route the wildcard to Puter.** Your proxy must forward `*.<domain>` (covering `api.*`, `app.*`, and `s3.<domain>`) and `*.site.<domain>` (and any other hosting domains) to Puter — same wildcard DNS as Step 2. Puter does the per-subdomain routing internally; the proxy just needs to hand it the traffic with the Host intact.
+
+With those in place the rest of the stack is unchanged — `docker compose up -d` as below.
+
+## Step 4 — Bring it up
+
+```bash
+docker compose up -d
+```
+
+First boot takes ~30s while MariaDB initialises and Puter applies the schema + default apps. Watch:
+
+```bash
+docker compose logs -f puter
+```
+
+Healthy startup:
+
+```
+[config] override from /etc/puter/config.json
+[mysql] running migrations from /opt/puter/dist/src/backend/clients/database/migrations/mysql: 2 file(s)
+[mysql] applied mysql_mig_1.sql (...)
+[mysql] applied mysql_mig_2.sql (9 statements)
+```
+
+Then open **<https://puter.local>** (or `http://` if you skipped TLS). Login is `admin` — the temp password is printed once in the puter container logs on first boot:
+
+```bash
+docker compose logs puter | grep tmp_password
+```
+
+Change it in Settings after first login.
+
+## Additional configuration
+
+All optional. Drop any of the blocks below into `puter/config/config.json` and `docker compose restart puter`. See [config.template.jsonc](../config.template.jsonc) for the full list. Per-key documentation lives in [src/backend/types.ts](../src/backend/types.ts).
+
+### PostgreSQL database
+
+> **Community contribution — expect rough edges.** PostgreSQL support was contributed by the community and is not run by Puter.com production. It boots, applies the bundled schema, and exercises the common user/app/fsentry/session/permission/OIDC flows in the integration tests, but less-traveled SQL call sites may still need porting. If you hit a query that doesn't work on Postgres, please open an issue. For production self-hosting today, MariaDB/MySQL and SQLite are the supported defaults.
+
+The bundled Docker Compose stack still defaults to MariaDB. To use PostgreSQL instead, run a PostgreSQL service yourself, point Puter at it, and use the PostgreSQL migration path:
+
+```json
+"database": {
+    "engine": "postgres",
+    "host": "postgres",
+    "port": 5432,
+    "user": "puter",
+    "password": "...",
+    "database": "puter",
+    "migrationPaths": ["/opt/puter/dist/src/backend/clients/database/migrations/postgres"]
+}
+```
+
+You may use `"connectionString": "postgres://puter:...@postgres:5432/puter"` instead of the host/user/password fields. Puter only needs normal PostgreSQL connection details and the migration path; CloudNativePG is one possible Kubernetes operator, but no operator-specific manifests are required by Puter.
+
+### Email (SMTP)
+
+Used for password resets, email confirmation, and notifications. Without it those flows silently fail.
+
+```json
+"email": {
+    "from": "\"Puter\" <no-reply@puter.example.com>",
+    "host": "smtp.example.com",
+    "port": 587,
+    "secure": false,
+    "auth": { "user": "...", "pass": "..." }
+}
+```
+
+To require email confirmation before login, also set `"strict_email_verification_required": true`.
+
+### Sign in with Google (or another OIDC provider)
+
+```json
+"oidc": {
+    "providers": {
+        "google": {
+            "client_id": "...apps.googleusercontent.com",
+            "client_secret": "...",
+            "scopes": "openid email profile"
+        }
+    }
+}
+```
+
+Add `https://puter.<your-domain>/auth/oidc/callback/login` to the OAuth client's authorized redirect URIs in the Google Cloud Console. For non-Google providers, replace `google` with a custom id and supply `authorization_endpoint` / `token_endpoint` / `userinfo_endpoint` explicitly.
+
+### Sign in with Apple
+
+```json
+"oidc": {
+    "providers": {
+        "apple": {
+            "client_id": "com.example.your-service-id",
+            "team_id": "YOUR_TEAM_ID",
+            "key_id": "YOUR_KEY_ID",
+            "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+        }
+    }
+}
+```
+
+The `client_id` is your Apple Services ID. `team_id`, `key_id`, and `private_key` come from the Apple Developer Portal (Keys section — create a key with "Sign in with Apple" enabled). The `private_key` is the contents of the `.p8` file Apple provides. Add `https://puter.<your-domain>/auth/oidc/callback/login` and `https://puter.<your-domain>/auth/oidc/callback/signup` as return URLs in the Apple Services ID configuration.
+
+### Sign in with Microsoft
+
+```json
+"oidc": {
+    "providers": {
+        "microsoft": {
+            "client_id": "YOUR_APPLICATION_CLIENT_ID",
+            "client_secret": "YOUR_CLIENT_SECRET_VALUE",
+            "tenant_id": "YOUR_TENANT_ID"
+        }
+    }
+}
+```
+
+Register an app in the Azure Portal (Microsoft Entra ID → App registrations). The `client_id` is the Application (client) ID, `client_secret` is a client secret value, and `tenant_id` is the Directory (tenant) ID. Use `common` as `tenant_id` to allow any Microsoft account (personal and organizational); omit it to default to `common`. Add `https://puter.<your-domain>/auth/oidc/callback/login` and `https://puter.<your-domain>/auth/oidc/callback/signup` as redirect URIs under Authentication in the app registration.
+
+### AI providers
+
+Any provider with a key set is auto-enabled. Same shape as `ollama` above:
+
+```json
+"providers": {
+    "claude":            { "apiKey": "sk-ant-..." },
+    "openai-completion": { "apiKey": "sk-..." },
+    "gemini":            { "apiKey": "..." },
+    "openai-image-generation": { "apiKey": "sk-..." }
+}
+```
+
+Full provider list (chat, image, video, TTS, OCR) is in the template.
+
+### Per-user storage quota
+
+Default is 100 MB per user.
+
+```json
+"storage_capacity": 5368709120,   // 5 GB
+"is_storage_limited": true
+```
+
+Set `is_storage_limited: false` for unlimited (bounded by host disk).
+
+### Captcha on signup / login
+
+Built-in proof-of-work captcha — no external service needed.
+
+```json
+"captcha": { "enabled": true, "difficulty": "medium" }
+```
+
+`difficulty` is one of `easy` / `medium` / `hard`.
+
+### Block disposable email TLDs
+
+Only enforced when `env: "prod"`.
+
+```json
+"blockedEmailDomains": ["mailinator.com", "tempmail.com", "guerrillamail.com"]
+```
+
+### Password policy
+
+```json
+"min_pass_length": 12
+```
+
+### Contact-form recipient
+
+Where the in-app contact form posts. Defaults to `support@puter.com`.
+
+```json
+"support_email": "support@puter.example.com"
+```
+
+## Optional: local LLM (Ollama)
+
+The `ollama` and `ollama-init` services live behind a compose profile so they don't run unless you ask for them. By default, `puter/config/config.json` has `"ollama": { "enabled": false }` — Puter skips the auto-probe entirely. To run a local model:
+
+1. Flip the config:
+    ```json
+    "providers": {
+        "ollama": { "apiBaseUrl": "http://ollama:11434" }
+    }
+    ```
+2. (Optional) Pick a model in `.env`:
+    ```bash
+    OLLAMA_DEFAULT_MODEL=tinyllama   # default — 1.1B, ~640 MB on disk, ~700 MB RAM
+    # Other tiny picks: qwen2.5:0.5b, llama3.2:1b
+    # Larger / better: phi3.5, llama3.2, mistral
+    ```
+3. Bring up with the `ai` profile:
+    ```bash
+    docker compose --profile ai up -d
+    docker compose logs -f ollama-init
+    ```
+    `ollama-init` exits 0 once the model is pulled. Subsequent boots find the model already on disk and the pull is a fast no-op.
+
+Without `--profile ai`, the `ollama` containers stay down and Puter (with `enabled: false`) doesn't try to reach them — the rest of the stack runs identically.
+
+For GPU acceleration (NVIDIA), uncomment the `deploy:` block under the `ollama` service in [docker-compose.yml](../docker-compose.yml). Requires `nvidia-container-toolkit` on the host.
+
+## Building from source instead of pulling
+
+If you want to test local Dockerfile changes against the full stack, uncomment the `build:` block in [docker-compose.yml](../docker-compose.yml) under the `puter` service, change `pull_policy: always` → `pull_policy: never`, then:
+
+```bash
+docker compose up -d --build
+```
+
+---
+
+## Managing running backend
+
+```bash
+# update
+docker compose pull
+docker compose up -d
+
+# logs
+docker compose logs -f puter
+
+# stop, keep data
+docker compose down
+
+# stop, NUKE all state (irreversible)
+docker compose down
+rm -rf puter/data
+```
+
+Migrations re-apply idempotently across pulls. Volumes are preserved.
+
+## Troubleshooting
+
+**Site loads but I get "Bad Gateway" / nginx errors.**
+The puter container failed to come up. `docker compose logs puter` will tell you which dependency rejected it (most often DB password mismatch between `.env` and `config.json`).
+
+**Login screen says "admin password not set".**
+First-boot temp password is logged once. Find it: `docker compose logs puter | grep "tmp_password"`. After login, change it in Settings.
+
+**Healthcheck reports unhealthy but the site works.**
+The healthcheck hits `puter.localhost:4100/test` from inside the container. If you changed `domain` or `port`, the check still uses defaults. The site itself is fine.
+
+**Nothing resolves at `puter.example.com` after DNS changes.**
+DNS propagates slowly. `dig puter.example.com` and `dig api.puter.example.com` should both return your server IP. If not, give it 5–60 minutes.
+
+**`docker compose up` hangs at "waiting for service to be healthy".**
+`docker compose ps` shows which container is unhealthy. MariaDB takes ~20–30s on a cold boot; everything else under 5s. If something stays unhealthy, `logs <service>` will tell you why.
+
+**`Error: DynamoDB aws config requires both access_key and secret_key`.**
+You wrote `accessKeyId` / `secretAccessKey` under `dynamo.aws`. That config block uses snake_case (`access_key` / `secret_key`). Only the `s3.s3Config` block uses camelCase.
