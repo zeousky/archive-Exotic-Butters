@@ -104,4 +104,4 @@ To keep usage down, lean on `/effort low` and only attach the files you actually
 
 ## License
 
-MIT. See the [LICENSE](LICENSE) file.
+The bot and chatb code use the MIT license in [LICENSE](LICENSE). The vendored `puter/` source has its own licenses, including [AGPL-3.0-only](puter/LICENSE.txt); see the license files in that directory before reusing it.
